@@ -191,6 +191,11 @@ function shouldImplicitlyMoveCommentedIssueToTodoForAgent(input: {
   if (!isClosedIssueStatus(input.issueStatus) && input.issueStatus !== "blocked") return false;
   if (typeof input.assigneeAgentId !== "string" || input.assigneeAgentId.length === 0) return false;
   if (input.actorType === "agent" && input.actorId === input.assigneeAgentId) return false;
+  // Agent-authored comments on closed issues must not implicitly reopen the issue.
+  // A close-out acknowledgment from another agent was treated as a reopen, which combined
+  // with deferred-wake promotion to flip `done` back to `todo` and re-checkout the assignee.
+  // Agents that genuinely need to reopen must pass `reopen: true` explicitly.
+  if (isClosedIssueStatus(input.issueStatus) && input.actorType === "agent") return false;
   return true;
 }
 
