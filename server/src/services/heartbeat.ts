@@ -6327,6 +6327,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return recovery.scanSilentActiveRuns(opts);
   }
 
+  async function scanQueueStuckBatch(opts?: { now?: Date; companyId?: string }) {
+    return recovery.scanQueueStuckBatch(opts);
+  }
+
   async function reconcileProductivityReviews(opts?: { now?: Date; companyId?: string }) {
     return productivityReviews.reconcileProductivityReviews(opts);
   }
@@ -9411,6 +9415,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     reconcileIssueGraphLiveness,
 
     scanSilentActiveRuns,
+
+    scanQueueStuckBatch,
 
     reconcileProductivityReviews,
 
