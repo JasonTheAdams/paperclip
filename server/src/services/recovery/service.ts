@@ -60,6 +60,12 @@ const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = ["failed", "cancelled", "ti
 export const ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS = 60 * 60 * 1000;
 export const ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS = 4 * 60 * 60 * 1000;
 export const ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS = 30 * 60 * 1000;
+// Watchdog tick-gap rebase: if the wall-clock between two adjacent watchdog
+// scans exceeds the threshold (e.g., laptop sleep/wake or host suspension), the
+// watchdog suppresses scans until it has accumulated a fresh suspicion window
+// of continuous observation. This avoids alert bursts on resume.
+export const ACTIVE_RUN_WATCHDOG_TICK_REBASE_THRESHOLD_MS = 5 * 60 * 1000;
+export const ACTIVE_RUN_WATCHDOG_TICK_EXPECTED_INTERVAL_MS = 30 * 1000;
 const ACTIVE_RUN_OUTPUT_EVIDENCE_TAIL_BYTES = 8 * 1024;
 const STRANDED_ISSUE_RECOVERY_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.strandedIssueRecovery;
 const STALE_ACTIVE_RUN_EVALUATION_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.staleActiveRunEvaluation;
@@ -354,12 +360,35 @@ function buildLivenessOriginalIssueComment(finding: IssueLivenessFinding, escala
   ].join("\n");
 }
 
-export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup }) {
+export function recoveryService(
+  db: Db,
+  deps: {
+    enqueueWakeup: RecoveryWakeup;
+    /**
+     * Returns the current real wall-clock time. Defaults to `new Date()`. The
+     * watchdog uses this only to detect tick gaps (e.g., laptop sleep/wake) —
+     * the silence threshold itself is still measured in logical run time.
+     * Tests may override this to simulate a wall-clock gap deterministically.
+     */
+    wallClockNow?: () => Date;
+  },
+) {
   const issuesSvc = issueService(db);
   const treeControlSvc = issueTreeControlService(db);
   const budgets = budgetService(db);
   const instanceSettings = instanceSettingsService(db);
   const runLogStore = getRunLogStore();
+  const wallClockNow = deps.wallClockNow ?? (() => new Date());
+
+  // Watchdog tick-gap rebase state. `lastSilentRunScanRealAt` records the real
+  // wall clock of the previous `scanSilentActiveRuns` invocation. If two scans
+  // are separated by a real-time gap larger than the rebase threshold (laptop
+  // sleep/wake or host suspension), `silenceObservationFloorAt` is advanced so
+  // the watchdog refuses to fire until it has accumulated a fresh suspicion
+  // window of continuous observation. The floor starts at the epoch so cold
+  // boots do not skip the first scan.
+  let lastSilentRunScanRealAt: Date | null = null;
+  let silenceObservationFloorAt: Date = new Date(0);
 
   const getCurrentUserRedactionOptions = async () => ({
     enabled: (await instanceSettings.getGeneral()).censorUsernameInLogs,
@@ -639,7 +668,12 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   }
 
   function silenceStartedAtForRun(run: Pick<typeof heartbeatRuns.$inferSelect, "lastOutputAt" | "processStartedAt" | "startedAt" | "createdAt">) {
-    return run.lastOutputAt ?? run.processStartedAt ?? run.startedAt ?? run.createdAt ?? null;
+    // Until the adapter spawns the underlying process there is nothing to be
+    // silent — `startedAt`/`createdAt` reflect queue time, which can sit for
+    // hours on a busy scheduler. Treat queued/launching runs as having no
+    // silence baseline so the watchdog does not flag them as stale output.
+    if (!run.processStartedAt) return null;
+    return run.lastOutputAt ?? run.processStartedAt;
   }
 
   function silenceAgeMsForRun(run: Pick<typeof heartbeatRuns.$inferSelect, "lastOutputAt" | "processStartedAt" | "startedAt" | "createdAt">, now = new Date()) {
@@ -1118,6 +1152,55 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
 
   async function scanSilentActiveRuns(opts?: { now?: Date; companyId?: string }) {
     const now = opts?.now ?? new Date();
+
+    // Tick-gap rebase: if the real wall clock between two adjacent scans jumps
+    // far beyond the expected scheduler interval, advance the observation
+    // floor so the watchdog rebuilds a fresh suspicion window before
+    // alerting. This prevents alert bursts after laptop sleep/wake or host
+    // suspension. Real wall clock is used here (not `opts.now`) because the
+    // rebase trigger is about whether our process kept ticking, which is a
+    // real-time question independent of any logical clock the caller passes.
+    const realNow = wallClockNow();
+    const previousScanRealAt = lastSilentRunScanRealAt;
+    if (previousScanRealAt) {
+      const gapMs = realNow.getTime() - previousScanRealAt.getTime();
+      if (gapMs > ACTIVE_RUN_WATCHDOG_TICK_REBASE_THRESHOLD_MS) {
+        const rebasedFloor = new Date(now.getTime() - ACTIVE_RUN_WATCHDOG_TICK_EXPECTED_INTERVAL_MS);
+        if (rebasedFloor.getTime() > silenceObservationFloorAt.getTime()) {
+          silenceObservationFloorAt = rebasedFloor;
+        }
+        logger.warn(
+          {
+            previousScanRealAt: previousScanRealAt.toISOString(),
+            realNow: realNow.toISOString(),
+            gapMs,
+            silenceObservationFloorAt: silenceObservationFloorAt.toISOString(),
+          },
+          "active-run output watchdog detected tick gap; rebasing silence observation floor",
+        );
+      }
+    }
+    lastSilentRunScanRealAt = realNow;
+
+    const observedSilenceMs = now.getTime() - silenceObservationFloorAt.getTime();
+    const result = {
+      scanned: 0,
+      created: 0,
+      existing: 0,
+      escalated: 0,
+      snoozed: 0,
+      skipped: 0,
+      evaluationIssueIds: [] as string[],
+      rebased: false,
+    };
+    if (observedSilenceMs < ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS) {
+      // The watchdog has not yet observed a full suspicion window of
+      // continuous wall-clock since the last gap (or first scan). Skip alert
+      // creation this tick; real stalls will surface on the next normal tick.
+      result.rebased = true;
+      return result;
+    }
+
     const suspicionBefore = new Date(now.getTime() - ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS);
     const candidates = await db
       .select()
@@ -1126,21 +1209,18 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         and(
           opts?.companyId ? eq(heartbeatRuns.companyId, opts.companyId) : undefined,
           eq(heartbeatRuns.status, "running"),
-          sql`coalesce(${heartbeatRuns.lastOutputAt}, ${heartbeatRuns.processStartedAt}, ${heartbeatRuns.startedAt}, ${heartbeatRuns.createdAt}) <= ${suspicionBefore.toISOString()}::timestamptz`,
+          // Only runs whose adapter process has actually spawned can be
+          // output-silent. Queued/launching runs (processStartedAt is null)
+          // are excluded — they are tracked by the queue/scheduler watchers
+          // (LEV-100/LEV-101), not the output watchdog.
+          sql`${heartbeatRuns.processStartedAt} is not null`,
+          sql`coalesce(${heartbeatRuns.lastOutputAt}, ${heartbeatRuns.processStartedAt}) <= ${suspicionBefore.toISOString()}::timestamptz`,
         ),
       )
       .orderBy(asc(heartbeatRuns.createdAt))
       .limit(100);
 
-    const result = {
-      scanned: candidates.length,
-      created: 0,
-      existing: 0,
-      escalated: 0,
-      snoozed: 0,
-      skipped: 0,
-      evaluationIssueIds: [] as string[],
-    };
+    result.scanned = candidates.length;
 
     for (const run of candidates) {
       if (await latestActiveOutputQuietUntilDecision(run.companyId, run.id, now)) {

@@ -20,7 +20,10 @@ import {
   ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS,
   heartbeatService,
 } from "../services/heartbeat.ts";
-import { recoveryService } from "../services/recovery/service.ts";
+import {
+  ACTIVE_RUN_WATCHDOG_TICK_REBASE_THRESHOLD_MS,
+  recoveryService,
+} from "../services/recovery/service.ts";
 import { getRunLogStore } from "../services/run-log-store.ts";
 
 const mockAdapterExecute = vi.hoisted(() =>
@@ -94,7 +97,14 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
     await tempDb?.cleanup();
   });
 
-  async function seedRunningRun(opts: { now: Date; ageMs: number; withOutput?: boolean; logChunk?: string }) {
+  async function seedRunningRun(opts: {
+    now: Date;
+    ageMs: number;
+    withOutput?: boolean;
+    logChunk?: string;
+    /** Pass null to simulate a queued/not-yet-spawned run. Defaults to startedAt. */
+    processStartedAtOverride?: Date | null;
+  }) {
     const companyId = randomUUID();
     const managerId = randomUUID();
     const coderId = randomUUID();
@@ -103,6 +113,9 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
     const issuePrefix = `W${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
     const startedAt = new Date(opts.now.getTime() - opts.ageMs);
     const lastOutputAt = opts.withOutput ? new Date(opts.now.getTime() - 5 * 60 * 1000) : null;
+    const processStartedAt = opts.processStartedAtOverride === undefined
+      ? startedAt
+      : opts.processStartedAtOverride;
 
     await db.insert(companies).values({
       id: companyId,
@@ -155,7 +168,7 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
       invocationSource: "assignment",
       triggerDetail: "system",
       startedAt,
-      processStartedAt: startedAt,
+      processStartedAt,
       lastOutputAt,
       lastOutputSeq: opts.withOutput ? 3 : 0,
       lastOutputStream: opts.withOutput ? "stdout" : null,
@@ -546,5 +559,128 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
       createdByRunId: randomUUID(),
     });
     expect(decision.createdByRunId).toBe(managerRunId);
+  });
+
+  it("does not alert on queued runs with no processStartedAt or run output", async () => {
+    // LEV-100/LEV-101: queued-but-not-yet-spawned runs sit on `startedAt` (the
+    // queue stamp) for hours; the output watchdog must not treat them as
+    // silent because no process has had a chance to emit anything.
+    const now = new Date("2026-04-22T20:00:00.000Z");
+    const { companyId, runId } = await seedRunningRun({
+      now,
+      ageMs: ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS + 60 * 60 * 1000,
+      processStartedAtOverride: null,
+    });
+    const heartbeat = heartbeatService(db);
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn() });
+
+    const result = await heartbeat.scanSilentActiveRuns({ now, companyId });
+    expect(result).toMatchObject({ scanned: 0, created: 0, escalated: 0 });
+
+    const evaluations = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "stale_active_run_evaluation")));
+    expect(evaluations).toHaveLength(0);
+
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    const silence = await recovery.buildRunOutputSilence(run!, now);
+    expect(silence.silenceStartedAt).toBeNull();
+    expect(silence.silenceAgeMs).toBeNull();
+    expect(silence.level).toBe("ok");
+  });
+
+  it("rebases the silence floor and suppresses alerts after a wall-clock tick gap", async () => {
+    // Simulated host suspension: real wall-clock between two scans jumps far
+    // beyond the rebase threshold. The watchdog must not fire on runs whose
+    // recorded silence is now stale relative to wall clock; instead it must
+    // re-establish a fresh suspicion window before alerting.
+    const now = new Date("2026-04-22T20:00:00.000Z");
+    const { companyId, runId } = await seedRunningRun({
+      now,
+      ageMs: ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS + 60_000,
+    });
+    const wallClockTimes: Date[] = [
+      new Date("2026-04-22T11:59:30.000Z"),
+      new Date("2026-04-22T20:00:00.000Z"),
+    ];
+    let wallClockIndex = 0;
+    const recovery = recoveryService(db, {
+      enqueueWakeup: vi.fn(),
+      wallClockNow: () => wallClockTimes[Math.min(wallClockIndex++, wallClockTimes.length - 1)]!,
+    });
+
+    // Scan #1 establishes the previous-scan timestamp, just under the
+    // suspicion window so no alert fires regardless of rebase logic.
+    const earlyScan = await recovery.scanSilentActiveRuns({
+      now: new Date("2026-04-22T12:00:00.000Z"),
+      companyId,
+    });
+    expect(earlyScan).toMatchObject({ scanned: 0, created: 0 });
+
+    // Scan #2: real wall-clock jumps 8h forward (laptop sleep). The
+    // observation floor is rebased so we skip alerting this tick.
+    const postSuspendScan = await recovery.scanSilentActiveRuns({ now, companyId });
+    expect(postSuspendScan).toMatchObject({ scanned: 0, created: 0, rebased: true });
+
+    const evaluations = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "stale_active_run_evaluation")));
+    expect(evaluations).toHaveLength(0);
+    // Sanity: the seeded run was genuinely silent for >critical threshold,
+    // confirming the watchdog suppressed an alert it would have fired absent
+    // the rebase.
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(now.getTime() - (run!.processStartedAt?.getTime() ?? 0))
+      .toBeGreaterThanOrEqual(ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS);
+  });
+
+  it("alerts on real spawned-process silence when ticks are continuous", async () => {
+    // Counter-test: when wall-clock progresses normally between scans, a run
+    // whose process spawned long ago and stopped emitting still alerts.
+    const now = new Date("2026-04-22T20:00:00.000Z");
+    const { companyId, managerId } = await seedRunningRun({
+      now,
+      ageMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 5 * 60 * 1000,
+    });
+    const wallClockBase = new Date("2026-05-06T12:00:00.000Z");
+    let wallClockMsSinceBase = 0;
+    const recovery = recoveryService(db, {
+      enqueueWakeup: vi.fn(),
+      wallClockNow: () => {
+        const at = new Date(wallClockBase.getTime() + wallClockMsSinceBase);
+        wallClockMsSinceBase += 30_000; // simulate 30s scheduler ticks
+        return at;
+      },
+    });
+
+    // First scan establishes lastSilentRunScanRealAt with no rebase. The run
+    // is genuinely silent past the suspicion window, so we expect an alert.
+    const result = await recovery.scanSilentActiveRuns({ now, companyId });
+    expect(result.scanned).toBeGreaterThanOrEqual(1);
+    expect(result.created).toBe(1);
+
+    const evaluations = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "stale_active_run_evaluation")));
+    expect(evaluations).toHaveLength(1);
+    expect(evaluations[0]?.assigneeAgentId).toBe(managerId);
+
+    // A second tightly-spaced scan (real-clock gap well under the rebase
+    // threshold) reuses the same evaluation rather than creating a duplicate.
+    const followup = await recovery.scanSilentActiveRuns({ now, companyId });
+    expect(followup).toMatchObject({ created: 0, existing: 1 });
+  });
+
+  it("exposes the tick-gap rebase threshold as a positive constant", () => {
+    // Sanity: the rebase threshold must be larger than a normal tick interval
+    // and smaller than the suspicion window (otherwise the watchdog would
+    // either rebase on every tick or never recover from a long suspension).
+    expect(ACTIVE_RUN_WATCHDOG_TICK_REBASE_THRESHOLD_MS).toBeGreaterThan(30_000);
+    expect(ACTIVE_RUN_WATCHDOG_TICK_REBASE_THRESHOLD_MS).toBeLessThan(
+      ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS,
+    );
   });
 });
