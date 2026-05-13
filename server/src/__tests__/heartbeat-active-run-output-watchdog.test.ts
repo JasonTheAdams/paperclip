@@ -22,6 +22,8 @@ import {
 } from "../services/heartbeat.ts";
 import {
   ACTIVE_RUN_WATCHDOG_TICK_REBASE_THRESHOLD_MS,
+  QUEUE_STUCK_BATCH_CRITICAL_THRESHOLD_MS,
+  QUEUE_STUCK_BATCH_SUSPICION_THRESHOLD_MS,
   recoveryService,
 } from "../services/recovery/service.ts";
 import { getRunLogStore } from "../services/run-log-store.ts";
@@ -682,5 +684,260 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
     expect(ACTIVE_RUN_WATCHDOG_TICK_REBASE_THRESHOLD_MS).toBeLessThan(
       ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS,
     );
+  });
+});
+
+describeEmbeddedPostgres("queue-stuck batch watchdog", () => {
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+  let db: ReturnType<typeof createDb>;
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-queue-stuck-batch-watchdog-");
+    db = createDb(tempDb.connectionString);
+  }, 30_000);
+
+  afterEach(async () => {
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      const activeRuns = await db
+        .select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns)
+        .where(sql`${heartbeatRuns.status} in ('queued', 'running')`);
+      if (activeRuns.length === 0) break;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    await db.execute(sql.raw(`TRUNCATE TABLE "companies" CASCADE`));
+  });
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+  async function seedCompanyWithCto(opts: { agentCount: number }) {
+    const companyId = randomUUID();
+    const ctoId = randomUUID();
+    const issuePrefix = `Q${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Queue Stuck Co",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: ctoId,
+      companyId,
+      name: "CTO",
+      role: "cto",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    const workerIds: string[] = [];
+    for (let i = 0; i < opts.agentCount; i += 1) {
+      const workerId = randomUUID();
+      workerIds.push(workerId);
+      await db.insert(agents).values({
+        id: workerId,
+        companyId,
+        name: `Worker ${i}`,
+        role: "engineer",
+        status: "running",
+        reportsTo: ctoId,
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+    }
+    return { companyId, ctoId, workerIds, issuePrefix };
+  }
+
+  async function seedQueuedRun(opts: {
+    companyId: string;
+    agentId: string;
+    startedAt: Date;
+    status?: "queued" | "running";
+  }) {
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId: opts.companyId,
+      agentId: opts.agentId,
+      status: opts.status ?? "running",
+      invocationSource: "timer",
+      triggerDetail: "system",
+      startedAt: opts.startedAt,
+      processStartedAt: null,
+      lastOutputAt: null,
+      lastOutputSeq: 0,
+      lastOutputStream: null,
+      contextSnapshot: {},
+      logBytes: 0,
+    });
+    return runId;
+  }
+
+  it("emits one batch alert when N runs are queued past the suspicion threshold", async () => {
+    // LEV-245: simulated 03:05 incident — five timer heartbeats queued ~1h21m
+    // ago. The previous behavior produced six near-identical review issues
+    // (LEV-93..LEV-98). The batch signal must collapse to one alert.
+    const now = new Date("2026-04-28T04:30:00.000Z");
+    const queuedAt = new Date(now.getTime() - QUEUE_STUCK_BATCH_SUSPICION_THRESHOLD_MS - 51 * 60 * 1000);
+    const { companyId, ctoId, workerIds } = await seedCompanyWithCto({ agentCount: 5 });
+    for (const workerId of workerIds) {
+      await seedQueuedRun({ companyId, agentId: workerId, startedAt: queuedAt });
+    }
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.scanQueueStuckBatch({ now, companyId });
+
+    expect(result.scanned).toBe(5);
+    expect(result.created).toBe(1);
+    expect(result.evaluationIssueIds).toHaveLength(1);
+
+    const evaluations = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "queue_stuck_batch_evaluation")));
+    expect(evaluations).toHaveLength(1);
+    // Severity is critical because the queued age (~1h21m) crosses the
+    // critical threshold; assignee is the CTO, dedup originId is the company.
+    expect(evaluations[0]).toMatchObject({
+      priority: "high",
+      assigneeAgentId: ctoId,
+      originId: companyId,
+      originFingerprint: `queue_stuck_batch:${companyId}`,
+    });
+    expect(evaluations[0]?.description).toContain("Affected runs");
+    expect(evaluations[0]?.description).toContain("Worker 0");
+  });
+
+  it("does not duplicate the alert when the same batch persists across two scan ticks", async () => {
+    // LEV-245 dedup contract: same (or growing) batch on a subsequent tick at
+    // the same severity must not create a second alert; we re-use the open
+    // evaluation issue.
+    const now = new Date("2026-04-28T04:30:00.000Z");
+    const queuedAt = new Date(now.getTime() - QUEUE_STUCK_BATCH_SUSPICION_THRESHOLD_MS - 5 * 60 * 1000);
+    const { companyId, workerIds } = await seedCompanyWithCto({ agentCount: 5 });
+    for (const workerId of workerIds) {
+      await seedQueuedRun({ companyId, agentId: workerId, startedAt: queuedAt });
+    }
+    const heartbeat = heartbeatService(db);
+
+    const first = await heartbeat.scanQueueStuckBatch({ now, companyId });
+    const second = await heartbeat.scanQueueStuckBatch({
+      now: new Date(now.getTime() + 60_000),
+      companyId,
+    });
+
+    expect(first.created).toBe(1);
+    expect(second.created).toBe(0);
+    expect(second.existing).toBe(1);
+
+    const evaluations = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "queue_stuck_batch_evaluation")));
+    expect(evaluations).toHaveLength(1);
+    // Suspicion-only batch (queued < 1h) is medium priority.
+    expect(evaluations[0]?.priority).toBe("medium");
+  });
+
+  it("escalates the open batch evaluation to critical when any run crosses the critical threshold", async () => {
+    const earlyNow = new Date("2026-04-28T04:00:00.000Z");
+    const queuedAt = new Date(earlyNow.getTime() - QUEUE_STUCK_BATCH_SUSPICION_THRESHOLD_MS - 5 * 60 * 1000);
+    const { companyId, workerIds } = await seedCompanyWithCto({ agentCount: 3 });
+    for (const workerId of workerIds) {
+      await seedQueuedRun({ companyId, agentId: workerId, startedAt: queuedAt });
+    }
+    const heartbeat = heartbeatService(db);
+
+    const initial = await heartbeat.scanQueueStuckBatch({ now: earlyNow, companyId });
+    expect(initial.created).toBe(1);
+
+    const lateNow = new Date(queuedAt.getTime() + QUEUE_STUCK_BATCH_CRITICAL_THRESHOLD_MS + 60_000);
+    const escalation = await heartbeat.scanQueueStuckBatch({ now: lateNow, companyId });
+    expect(escalation.escalated).toBe(1);
+    expect(escalation.created).toBe(0);
+
+    const [evaluation] = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "queue_stuck_batch_evaluation")));
+    expect(evaluation?.priority).toBe("high");
+
+    // Subsequent tick at the same severity does not double-escalate.
+    const stable = await heartbeat.scanQueueStuckBatch({
+      now: new Date(lateNow.getTime() + 30_000),
+      companyId,
+    });
+    expect(stable.escalated).toBe(0);
+    expect(stable.existing).toBe(1);
+  });
+
+  it("emits no signal when the queue has drained to zero", async () => {
+    // LEV-245: queue drains to zero → no signal. We seed runs that are
+    // queued only briefly (under the suspicion threshold) and confirm
+    // nothing fires; then we confirm a second scan with no queued runs at
+    // all also fires nothing.
+    const now = new Date("2026-04-28T04:30:00.000Z");
+    const recentlyQueuedAt = new Date(now.getTime() - 5 * 60 * 1000);
+    const { companyId, workerIds } = await seedCompanyWithCto({ agentCount: 3 });
+    for (const workerId of workerIds) {
+      await seedQueuedRun({ companyId, agentId: workerId, startedAt: recentlyQueuedAt });
+    }
+    const heartbeat = heartbeatService(db);
+
+    const fresh = await heartbeat.scanQueueStuckBatch({ now, companyId });
+    expect(fresh).toMatchObject({ scanned: 0, created: 0, existing: 0, escalated: 0 });
+
+    // Drain the queue: mark all the runs as having spawned a process.
+    const spawnedAt = new Date(now.getTime() - 60_000);
+    await db
+      .update(heartbeatRuns)
+      .set({ processStartedAt: spawnedAt })
+      .where(eq(heartbeatRuns.companyId, companyId));
+
+    const drained = await heartbeat.scanQueueStuckBatch({
+      now: new Date(now.getTime() + QUEUE_STUCK_BATCH_SUSPICION_THRESHOLD_MS + 60_000),
+      companyId,
+    });
+    expect(drained).toMatchObject({ scanned: 0, created: 0 });
+
+    const evaluations = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "queue_stuck_batch_evaluation")));
+    expect(evaluations).toHaveLength(0);
+  });
+
+  it("does not regress the silent-run watchdog: runs with a spawned process still alert per-run", async () => {
+    // LEV-242 + LEV-245 boundary: the silent-run watchdog applies to runs
+    // whose process *has* spawned (processStartedAt set) and then went
+    // silent. The queue-stuck batch must not pick those up.
+    const now = new Date("2026-04-28T04:30:00.000Z");
+    const queuedAt = new Date(now.getTime() - QUEUE_STUCK_BATCH_SUSPICION_THRESHOLD_MS - 60_000);
+    const { companyId, workerIds } = await seedCompanyWithCto({ agentCount: 1 });
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId: workerIds[0]!,
+      status: "running",
+      invocationSource: "timer",
+      triggerDetail: "system",
+      startedAt: queuedAt,
+      processStartedAt: queuedAt,
+      lastOutputAt: null,
+      lastOutputSeq: 0,
+      lastOutputStream: null,
+      contextSnapshot: {},
+      logBytes: 0,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const batch = await heartbeat.scanQueueStuckBatch({ now, companyId });
+    expect(batch).toMatchObject({ scanned: 0, created: 0 });
   });
 });

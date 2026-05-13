@@ -67,8 +67,17 @@ export const ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS = 30 * 60 * 1000;
 export const ACTIVE_RUN_WATCHDOG_TICK_REBASE_THRESHOLD_MS = 5 * 60 * 1000;
 export const ACTIVE_RUN_WATCHDOG_TICK_EXPECTED_INTERVAL_MS = 30 * 1000;
 const ACTIVE_RUN_OUTPUT_EVIDENCE_TAIL_BYTES = 8 * 1024;
+// Queue-stuck batch back-pressure (LEV-245). LEV-242 silenced the per-run
+// silent-output watchdog on queued/launching runs; this signal restores the
+// "scheduler is wedged" alert as a single deduped batch instead of one
+// review issue per agent. Suspicion fires at 30m; severity escalates to
+// critical once any run in the batch crosses 1h.
+export const QUEUE_STUCK_BATCH_SUSPICION_THRESHOLD_MS = 30 * 60 * 1000;
+export const QUEUE_STUCK_BATCH_CRITICAL_THRESHOLD_MS = 60 * 60 * 1000;
+export const QUEUE_STUCK_BATCH_MIN_RUNS = 1;
 const STRANDED_ISSUE_RECOVERY_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.strandedIssueRecovery;
 const STALE_ACTIVE_RUN_EVALUATION_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.staleActiveRunEvaluation;
+const QUEUE_STUCK_BATCH_EVALUATION_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.queueStuckBatchEvaluation;
 const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
 
 type RecoveryWakeupOptions = {
@@ -1235,6 +1244,290 @@ export function recoveryService(
       if ("evaluationIssueId" in outcome && outcome.evaluationIssueId) {
         result.evaluationIssueIds.push(outcome.evaluationIssueId);
       }
+    }
+
+    return result;
+  }
+
+  function queueStuckBatchOriginFingerprint(companyId: string) {
+    return `queue_stuck_batch:${companyId}`;
+  }
+
+  async function findOpenQueueStuckBatchEvaluation(companyId: string) {
+    const [row] = await db
+      .select({
+        id: issues.id,
+        identifier: issues.identifier,
+        status: issues.status,
+        priority: issues.priority,
+        assigneeAgentId: issues.assigneeAgentId,
+      })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, companyId),
+          eq(issues.originKind, QUEUE_STUCK_BATCH_EVALUATION_ORIGIN_KIND),
+          eq(issues.originId, companyId),
+          isNull(issues.hiddenAt),
+          notInArray(issues.status, ["done", "cancelled"]),
+        ),
+      )
+      .limit(1);
+    return row ?? null;
+  }
+
+  async function resolveQueueStuckBatchOwnerAgentId(companyId: string) {
+    const candidates = await db
+      .select()
+      .from(agents)
+      .where(and(eq(agents.companyId, companyId), inArray(agents.role, ["cto", "ceo"])))
+      .orderBy(sql`case when ${agents.role} = 'cto' then 0 else 1 end`, asc(agents.createdAt));
+    for (const candidate of candidates) {
+      if (isAgentInvokable(candidate)) return candidate.id;
+    }
+    return null;
+  }
+
+  function buildQueueStuckBatchDescription(input: {
+    companyId: string;
+    runs: Array<{ id: string; agentId: string; startedAt: Date; status: string }>;
+    agentNamesById: Map<string, string | null>;
+    level: "suspicious" | "critical";
+    now: Date;
+    prefix: string;
+  }) {
+    const oldestStartedAt = input.runs.reduce(
+      (min, run) => (run.startedAt.getTime() < min.getTime() ? run.startedAt : min),
+      input.runs[0]!.startedAt,
+    );
+    const oldestAgeMs = input.now.getTime() - oldestStartedAt.getTime();
+
+    const lines: string[] = [];
+    lines.push(
+      `Paperclip detected scheduler back-pressure: ${input.runs.length} ` +
+        `run${input.runs.length === 1 ? "" : "s"} have been queued without ` +
+        `spawning a process for at least ${formatDuration(QUEUE_STUCK_BATCH_SUSPICION_THRESHOLD_MS)}.`,
+    );
+    lines.push("");
+    lines.push("## Signal");
+    lines.push("");
+    lines.push(`- Severity: ${input.level === "critical" ? "high" : "medium"}`);
+    lines.push(`- Oldest queued age: ${formatDuration(oldestAgeMs)}`);
+    lines.push(`- Suspicion threshold: ${formatDuration(QUEUE_STUCK_BATCH_SUSPICION_THRESHOLD_MS)}`);
+    lines.push(`- Critical threshold: ${formatDuration(QUEUE_STUCK_BATCH_CRITICAL_THRESHOLD_MS)}`);
+    lines.push("");
+    lines.push("## Affected runs");
+    lines.push("");
+    const sorted = [...input.runs].sort((a, b) => a.startedAt.getTime() - b.startedAt.getTime());
+    for (const run of sorted.slice(0, 25)) {
+      const ageMs = input.now.getTime() - run.startedAt.getTime();
+      const agentName = input.agentNamesById.get(run.agentId) ?? run.agentId;
+      lines.push(
+        `- ${runUiLink(run, input.prefix)} agent ${agentName} status \`${run.status}\` queued ${formatDuration(ageMs)}`,
+      );
+    }
+    if (sorted.length > 25) {
+      lines.push(`- ...and ${sorted.length - 25} more`);
+    }
+    lines.push("");
+    lines.push("## Decision Checklist");
+    lines.push("");
+    lines.push("- Confirm whether the scheduler is genuinely wedged (host saturation, deadlock) or self-recovering.");
+    lines.push("- If self-recovered (queue drained), close this issue as a false positive with the reason captured.");
+    lines.push("- If wedged, escalate to the appropriate operator/board to unblock the scheduler.");
+    lines.push("");
+    lines.push(
+      `This signal is deduped to a single open issue per company; growth or escalation will be ` +
+        `recorded as comments on this issue rather than new alerts.`,
+    );
+    return lines.join("\n");
+  }
+
+  async function createOrEscalateQueueStuckBatch(input: {
+    companyId: string;
+    runs: Array<{ id: string; agentId: string; startedAt: Date; status: string }>;
+    level: "suspicious" | "critical";
+    now: Date;
+  }) {
+    const existing = await findOpenQueueStuckBatchEvaluation(input.companyId);
+    const prefix = await getCompanyIssuePrefix(input.companyId);
+    const oldestStartedAt = input.runs.reduce(
+      (min, run) => (run.startedAt.getTime() < min.getTime() ? run.startedAt : min),
+      input.runs[0]!.startedAt,
+    );
+    const oldestAgeMs = input.now.getTime() - oldestStartedAt.getTime();
+
+    if (existing) {
+      if (input.level === "critical" && existing.priority !== "high") {
+        await issuesSvc.update(existing.id, { priority: "high" });
+        await issuesSvc.addComment(existing.id, [
+          "Queue-stuck back-pressure escalated to critical.",
+          "",
+          `- Affected runs: ${input.runs.length}`,
+          `- Oldest queued age: ${formatDuration(oldestAgeMs)}`,
+          `- Critical threshold: ${formatDuration(QUEUE_STUCK_BATCH_CRITICAL_THRESHOLD_MS)}`,
+        ].join("\n"), {});
+        await logActivity(db, {
+          companyId: input.companyId,
+          actorType: "system",
+          actorId: "system",
+          agentId: existing.assigneeAgentId,
+          runId: null,
+          action: "heartbeat.queue_stuck_batch_escalated",
+          entityType: "issue",
+          entityId: existing.id,
+          details: {
+            source: "recovery.scan_queue_stuck_batch",
+            level: input.level,
+            runCount: input.runs.length,
+            oldestAgeMs,
+          },
+        });
+        return { kind: "escalated" as const, evaluationIssueId: existing.id };
+      }
+      return { kind: "existing" as const, evaluationIssueId: existing.id };
+    }
+
+    const ownerAgentId = await resolveQueueStuckBatchOwnerAgentId(input.companyId);
+    const agentRows = await db
+      .select({ id: agents.id, name: agents.name })
+      .from(agents)
+      .where(
+        and(
+          eq(agents.companyId, input.companyId),
+          inArray(
+            agents.id,
+            input.runs.map((run) => run.agentId),
+          ),
+        ),
+      );
+    const agentNamesById = new Map<string, string | null>();
+    for (const row of agentRows) agentNamesById.set(row.id, row.name);
+    const description = buildQueueStuckBatchDescription({
+      companyId: input.companyId,
+      runs: input.runs,
+      agentNamesById,
+      level: input.level,
+      now: input.now,
+      prefix,
+    });
+    const evaluation = await issuesSvc.create(input.companyId, {
+      title: `Scheduler back-pressure: ${input.runs.length} run${input.runs.length === 1 ? "" : "s"} queued past threshold`,
+      description,
+      status: "todo",
+      priority: input.level === "critical" ? "high" : "medium",
+      assigneeAgentId: ownerAgentId,
+      assigneeAdapterOverrides: recoveryAssigneeAdapterOverrides(),
+      originKind: QUEUE_STUCK_BATCH_EVALUATION_ORIGIN_KIND,
+      originId: input.companyId,
+      originFingerprint: queueStuckBatchOriginFingerprint(input.companyId),
+    });
+
+    await logActivity(db, {
+      companyId: input.companyId,
+      actorType: "system",
+      actorId: "system",
+      agentId: ownerAgentId,
+      runId: null,
+      action: "heartbeat.queue_stuck_batch_detected",
+      entityType: "issue",
+      entityId: evaluation.id,
+      details: {
+        source: "recovery.scan_queue_stuck_batch",
+        level: input.level,
+        runCount: input.runs.length,
+        oldestAgeMs,
+      },
+    });
+    if (ownerAgentId) {
+      await deps.enqueueWakeup(ownerAgentId, {
+        source: "assignment",
+        triggerDetail: "system",
+        reason: "issue_assigned",
+        payload: withRecoveryModelProfileHint({
+          issueId: evaluation.id,
+        }),
+        requestedByActorType: "system",
+        requestedByActorId: null,
+        contextSnapshot: withRecoveryModelProfileHint({
+          issueId: evaluation.id,
+          taskId: evaluation.id,
+          wakeReason: "issue_assigned",
+          source: QUEUE_STUCK_BATCH_EVALUATION_ORIGIN_KIND,
+        }),
+      });
+    }
+    return { kind: "created" as const, evaluationIssueId: evaluation.id };
+  }
+
+  async function scanQueueStuckBatch(opts?: { now?: Date; companyId?: string }) {
+    const now = opts?.now ?? new Date();
+    const result = {
+      scanned: 0,
+      created: 0,
+      existing: 0,
+      escalated: 0,
+      drained: 0,
+      evaluationIssueIds: [] as string[],
+    };
+    const suspicionBefore = new Date(now.getTime() - QUEUE_STUCK_BATCH_SUSPICION_THRESHOLD_MS);
+    const criticalBefore = new Date(now.getTime() - QUEUE_STUCK_BATCH_CRITICAL_THRESHOLD_MS);
+
+    const candidates = await db
+      .select({
+        id: heartbeatRuns.id,
+        companyId: heartbeatRuns.companyId,
+        agentId: heartbeatRuns.agentId,
+        startedAt: heartbeatRuns.startedAt,
+        status: heartbeatRuns.status,
+      })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          opts?.companyId ? eq(heartbeatRuns.companyId, opts.companyId) : undefined,
+          // Queued or claimed-but-not-spawned runs both count as queue-stuck.
+          // LEV-242 excluded these from the silent-output watchdog so genuine
+          // back-pressure is no longer surfaced anywhere — this scan reinstates
+          // it as a single batch alert.
+          inArray(heartbeatRuns.status, ["queued", "running"]),
+          sql`${heartbeatRuns.processStartedAt} is null`,
+          sql`${heartbeatRuns.startedAt} <= ${suspicionBefore.toISOString()}::timestamptz`,
+        ),
+      )
+      .orderBy(asc(heartbeatRuns.startedAt));
+
+    result.scanned = candidates.length;
+
+    const runsByCompany = new Map<string, typeof candidates>();
+    for (const candidate of candidates) {
+      if (!candidate.startedAt) continue;
+      const list = runsByCompany.get(candidate.companyId) ?? [];
+      list.push(candidate);
+      runsByCompany.set(candidate.companyId, list);
+    }
+
+    for (const [companyId, runs] of runsByCompany) {
+      if (runs.length < QUEUE_STUCK_BATCH_MIN_RUNS) continue;
+      const level: "suspicious" | "critical" = runs.some(
+        (run) => run.startedAt!.getTime() <= criticalBefore.getTime(),
+      )
+        ? "critical"
+        : "suspicious";
+      const outcome = await createOrEscalateQueueStuckBatch({
+        companyId,
+        runs: runs.map((run) => ({
+          id: run.id,
+          agentId: run.agentId,
+          startedAt: run.startedAt!,
+          status: run.status,
+        })),
+        level,
+        now,
+      });
+      if (outcome.kind === "created") result.created += 1;
+      else if (outcome.kind === "existing") result.existing += 1;
+      else if (outcome.kind === "escalated") result.escalated += 1;
+      result.evaluationIssueIds.push(outcome.evaluationIssueId);
     }
 
     return result;
@@ -2829,6 +3122,7 @@ export function recoveryService(
     escalateStrandedAssignedIssue,
     recordWatchdogDecision,
     scanSilentActiveRuns,
+    scanQueueStuckBatch,
     reconcileStrandedAssignedIssues,
     buildIssueGraphLivenessAutoRecoveryPreview,
     reconcileIssueGraphLiveness,
